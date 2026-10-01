@@ -1,8 +1,9 @@
 # 多材料 3D 打印换料规划 API
 
 基于 **Python + FastAPI + Google OR-Tools（CP-SAT）** 的排产服务。给定 2～8 个打印作业
-（每个作业由若干**按顺序执行的层段**组成）、初始材料、材料切换 purge 体积矩阵、
-单次切换耗时与总 purge 容量，计算层段交错执行计划：
+（每个作业由若干**按顺序执行的层段**组成，**单作业层段数不设上限，25 段及以上的长作业
+同样受理**）、初始材料、材料切换 purge 体积矩阵、单次切换耗时与总 purge 容量，计算层段
+交错执行计划：
 
 - 作业之间**只能在层段边界交错**，层段不可拆分，作业内层段严格按序；
 - 每次材料切换按 `purge_matrix[from][to]` 消耗 purge 容量，并占用 `switch_seconds` 秒
@@ -49,6 +50,23 @@ curl http://localhost:8000/health
 - Swagger UI：http://localhost:8000/docs
 - ReDoc：http://localhost:8000/redoc
 
+服务启动后即可提交规划请求。普通示例与**长作业示例**（单作业 25 段）：
+
+```bash
+# 普通示例（4 层段）
+curl -X POST http://localhost:8000/plans \
+  -H 'Content-Type: application/json' \
+  -d @examples/request.json
+
+# 长作业示例（J1 含 25 个层段，共 28 层段；过去会被 422 拒绝，现正常进入 CP-SAT）
+curl -X POST http://localhost:8000/plans \
+  -H 'Content-Type: application/json' \
+  -d @examples/request_long_job.json
+```
+
+长作业在较大规模或限时较短时的状态语义，见后文
+[长作业（单作业 25 段及以上）](#长作业单作业-25-段及以上) 一节。
+
 ## 二、本地直接运行（可选）
 
 ```bash
@@ -75,7 +93,7 @@ pytest -q
 | `jobs` | 数组（2～8 项） | 作业列表 |
 | `jobs[].job_id` | 非空字符串 | 作业 ID，全局唯一 |
 | `jobs[].deadline_seconds` | 非负整数 | 截止秒数（相对开工时刻 0） |
-| `jobs[].segments` | 非空数组（1～24 段） | 按打印顺序排列的层段 |
+| `jobs[].segments` | 非空数组（≥1 段，**无上限**） | 按打印顺序排列的层段；25 段及以上的长作业正常受理 |
 | `segments[].material_id` | 非空字符串 | 层段材料 ID |
 | `segments[].print_seconds` | 非负整数 | 层段打印秒数 |
 | `segments[].volume_mm3` | 非负整数 | 层段耗材体积 mm³（记录用） |
@@ -214,14 +232,76 @@ curl -X POST http://localhost:8000/plans \
   仅作为防御性归因）；
 - `UNKNOWN`：限时内无法完成归因诊断。
 
+### 长作业（单作业 25 段及以上）
+
+层段数量**不再有 24 段的隐藏上限**：任何非空层段列表都会进入 CP-SAT 规划。
+示例文件 `examples/request_long_job.json` 中 `J1` 含 **25 个层段**、`J2` 含 3 个
+层段（共 28 段）。启动服务后：
+
+```bash
+curl -X POST http://localhost:8000/plans \
+  -H 'Content-Type: application/json' \
+  -d @examples/request_long_job.json
+```
+
+返回（2026 年在普通开发机上约 2～3 秒；下方为节选，`…` 处为省略内容）：
+
+```jsonc
+{
+  "status": "OPTIMAL",
+  "optimal": true,
+  "objective": {
+    "total_purge_mm3": 1200,
+    "total_tardiness_seconds": 0,
+    "purge_optimal": true,
+    "tardiness_optimal": true,
+    "lexicographic_minimal": true
+  },
+  "plan": [
+    {"order": 1, "job_id": "J1", "segment_index": 1, "material_id": "PLA",
+     "print_seconds": 10, "volume_mm3": 12, "start_seconds": 0, "end_seconds": 10}
+    // … 共 28 条：J1 的 segment_index 严格为 1..25、J2 为 1..3 …
+  ],
+  "switches": [
+    // … 24 条切换记录，字段与上方普通示例相同 …
+  ],
+  "job_tardiness": [
+    {"job_id": "J1", "completion_seconds": 390, "deadline_seconds": 100000, "tardy_seconds": 0},
+    {"job_id": "J2", "completion_seconds": 400, "deadline_seconds": 100000, "tardy_seconds": 0}
+  ],
+  "purge_used_mm3": 1200,
+  "purge_remaining_mm3": 8800,
+  "total_tardiness_seconds": 0,
+  "makespan_seconds": 400,
+  "infeasible_reason": null,
+  "solver_message": "已证明三级目标（purge、逾期、字典序）均最优"
+}
+```
+
+**更大模型 / 限时到期时的行为**：当层段总数很大（建模规模约为 n² 条弧）或
+`time_limit_seconds` 很短时，CP-SAT 可能来不及证明最优。此时服务：
+
+- **始终返回完整计划**（每个层段一条、`order` 连续、作业内层段严格 1..k 按序）、
+  完整切换记录、purge 余量与逐作业逾期明细——不会因"没算完"返回空计划；
+- 只在 purge、逾期、字典序三级目标**都已被证明**时才标 `"status": "OPTIMAL"`；
+  得到容量内可行计划但未证明最优时标 `"FEASIBLE"`；
+  限时内连容量内可行构造都不存在时标 `"UNKNOWN"`（仍附上完整构造计划供参考）；
+- 服务会先构造"作业 ID 串联"与"同材料贪心"两个合法序列作为 CP-SAT 的初始解，
+  三个求解阶段共享同一个墙钟限时，到期即携带当前最佳计划返回。
+
+例如对 8 个作业、每作业 26 段（共 208 层段）的请求把 `time_limit_seconds` 设为
+`0.5`，仍会得到 HTTP 200、208 条作业内严格按序的计划与 `FEASIBLE` 状态——
+既不会是 422，也不会是空计划；把限时放宽到默认 15 秒则可能进一步证明为
+`OPTIMAL`。
+
 ### 求解状态语义
 
 | `status` | `optimal` | 含义 |
 | --- | --- | --- |
-| `OPTIMAL` | `true` | 三级目标（含字典序决胜）均已由 CP-SAT 证明最优 |
-| `FEASIBLE` | `false` | 限时内得到可行计划，`objective` 给出当前目标值，但**未证明最优**（字典序决胜未完成证明时也用此状态） |
-| `INFEASIBLE` | `false` | 无解，见 `infeasible_reason` |
-| `UNKNOWN` | `false` | 限时内连可行解都未找到 |
+| `OPTIMAL` | `true` | purge、逾期、字典序三级目标均已由 CP-SAT 证明最优 |
+| `FEASIBLE` | `false` | 得到容量内可行计划，`objective` 给出当前目标值，但三级目标**未全部证明**（purge/逾期未证或字典序决胜未完成证明时都用此状态） |
+| `INFEASIBLE` | `false` | 无解，见 `infeasible_reason`，`plan` 为空 |
+| `UNKNOWN` | `false` | 限时内未找到容量内可行解、也未证明无解；响应仍附一份完整的构造性计划供参考（其 purge 可能已超容量，`optimal=false` 且各最优标记均为 false） |
 
 ### 非法数据（HTTP 422）
 
@@ -229,6 +309,7 @@ curl -X POST http://localhost:8000/plans \
 
 - 作业数不在 2～8；`job_id` 重复或为空；
 - 层段列表为空；打印秒数 / 体积 / 截止秒数 / 切换耗时 / 容量为负；
+  （注意：层段数量**没有**上限，25 段及以上属于合法长作业，见上一节）
 - purge 矩阵单元格为负、对角非 0；
 - 初始材料或某层段材料在矩阵中缺行或缺列；
 - 出现未声明的额外字段、类型错误等。
@@ -256,10 +337,11 @@ curl -i -X POST http://localhost:8000/plans \
 │   ├── schemas.py     # 请求/响应模型与 422 输入校验
 │   └── solver.py      # CP-SAT 建模、分阶段求解与字典序决胜
 ├── examples/
-│   ├── request.json              # 可行示例
+│   ├── request.json              # 可行示例（4 段）
+│   ├── request_long_job.json     # 长作业示例（J1 含 25 段，共 28 段）
 │   └── request_infeasible.json   # 容量超限示例
 ├── tests/
-│   └── test_plans.py  # 9 个端到端测试（最优性、无解、交错、优先级、422 等）
+│   └── test_plans.py  # 13 个端到端测试（最优性、长作业、超时语义、无解、交错、优先级、422 等）
 ├── Dockerfile
 ├── docker-compose.yml
 ├── requirements.txt
@@ -274,10 +356,15 @@ curl -i -X POST http://localhost:8000/plans \
 - 作业内层段用先后约束限制；弧被选中时强制层段开始时刻 = 上一层段结束 +
   切换耗时，因此计划天然紧密无空转。
 - 求解分三阶段：① CP-SAT 最小化总 purge（容量为硬约束）；② 固定 purge 最优值
-  后最小化总逾期；③ **逐位贪心 + 可行性证明**：对执行序列的每个位置，按
-  `(作业 ID, 层序)` 升序逐一尝试固定候选层段并用 CP-SAT 验证可行性，第一个可行者
-  即为该位字典序最优选择；每一步都经过可行性证明，全部位置完成即字典序最小。
+  后最小化总逾期（复用阶段 1 的模型，避免大模型重复建模）；③ **逐位贪心 +
+  可行性证明**：对执行序列的每个位置，按 `(作业 ID, 层序)` 升序逐一尝试固定
+  候选层段并用 CP-SAT 验证可行性，第一个可行者即为该位字典序最优选择；
+  每一步都经过可行性证明，全部位置完成即字典序最小。
   任何一步在限时内无法判定，则返回当前最优目标值下的可行计划并保守地标为
   `FEASIBLE`，绝不声称未证明的最优性。
+- 三个阶段共享同一个墙钟截止时刻（即请求的 `time_limit_seconds`，建模耗时另计）。
+  求解前先构造"作业 ID 串联"和"同材料贪心"两个合法序列作为**完整 solution
+  hint**，并在克隆模型上固定 hint 值快速确认其为初始可行解；因此即便主优化
+  到期毫无产出，也有完整、作业内严格按序的计划可返回。
 - 无解时临时移除容量上限再求最小 purge：仍无解归因为 `PRECEDENCE`，
   最小 purge 超出容量则归因为 `CAPACITY` 并给出最小需求值。

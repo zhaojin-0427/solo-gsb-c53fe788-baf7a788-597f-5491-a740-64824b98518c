@@ -31,8 +31,7 @@ class JobIn(BaseModel):
     segments: list[SegmentIn] = Field(
         ...,
         min_length=1,
-        max_length=24,
-        description="按打印顺序排列的层段（1~24 段）",
+        description="按打印顺序排列的层段（非空；长作业可含 25 段及以上，不设上限）",
     )
 
 

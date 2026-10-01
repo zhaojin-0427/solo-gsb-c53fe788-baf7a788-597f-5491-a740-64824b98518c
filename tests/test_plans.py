@@ -190,6 +190,151 @@ def test_lexicographic_tiebreak_prefects_smaller_job_id():
     assert d["objective"]["lexicographic_minimal"] is True
 
 
+# ----------------------------- 长作业（>=25 段） -----------------------------
+
+def assert_plan_complete_and_ordered(d: dict, nseg: int, job_counts: dict):
+    """通用校验：计划完整、作业内层段严格按序、切换/purge/逾期明细自洽。"""
+    assert d["status"] in ("OPTIMAL", "FEASIBLE", "UNKNOWN")
+    assert len(d["plan"]) == nseg
+    assert [p["order"] for p in d["plan"]] == list(range(1, nseg + 1))
+
+    per_job = {}
+    for p in d["plan"]:
+        per_job.setdefault(p["job_id"], []).append(p["segment_index"])
+    assert set(per_job) == set(job_counts)
+    for job_id, count in job_counts.items():
+        assert per_job[job_id] == list(range(1, count + 1))
+
+    # 切换记录与 purge 账实相符
+    assert sum(s["purge_mm3"] for s in d["switches"]) == d["purge_used_mm3"]
+    cur = None
+    for s in d["switches"]:
+        assert s["from_material"] != s["to_material"]
+
+    # 时间线紧密：相邻层段之间要么 0 间隙，要么恰好一次切换耗时
+    sw_by_after = {s["after_segment_order"]: s for s in d["switches"]}
+    if d["switches"]:
+        first_switch = min(s["after_segment_order"] for s in d["switches"])
+        if first_switch == 0:
+            s0 = sw_by_after[0]
+            assert d["plan"][0]["start_seconds"] == s0["switch_seconds"]
+    for i, p in enumerate(d["plan"][:-1], start=1):
+        gap = sw_by_after[i]["switch_seconds"] if i in sw_by_after else 0
+        assert d["plan"][i]["start_seconds"] == p["end_seconds"] + gap
+
+    # 逾期明细与汇总一致
+    assert len(d["job_tardiness"]) == len(job_counts)
+    assert sum(j["tardy_seconds"] for j in d["job_tardiness"]) == d[
+        "total_tardiness_seconds"
+    ]
+    assert d["objective"]["total_purge_mm3"] == d["purge_used_mm3"]
+    assert d["objective"]["total_tardiness_seconds"] == d[
+        "total_tardiness_seconds"
+    ]
+    # 状态与各最优标记严格一致：只有三级全部证明才可标 OPTIMAL
+    flags = d["objective"]
+    assert d["optimal"] == (d["status"] == "OPTIMAL")
+    assert d["optimal"] == all(
+        flags[k]
+        for k in ("purge_optimal", "tardiness_optimal", "lexicographic_minimal")
+    )
+
+
+def _long_job_payload(k: int) -> dict:
+    seg = lambda m: {"material_id": m, "print_seconds": 3, "volume_mm3": 5}
+    return {
+        "jobs": [
+            {
+                "job_id": "J1",
+                "deadline_seconds": 10**9,
+                "segments": [seg("A") if i % 2 == 0 else seg("B") for i in range(k)],
+            },
+            {"job_id": "J2", "deadline_seconds": 10**9,
+             "segments": [seg("A"), seg("B")]},
+        ],
+        "initial_material": "A",
+        "purge_matrix": {"A": {"A": 0, "B": 70}, "B": {"A": 40, "B": 0}},
+        "switch_seconds": 3,
+        "total_purge_capacity_mm3": 10**9,
+        "time_limit_seconds": 15,
+    }
+
+
+def test_twenty_four_segments_still_accepted():
+    payload = _long_job_payload(24)
+    r = post(payload)
+    assert r.status_code == 200
+    d = r.json()
+    assert_plan_complete_and_ordered(d, 26, {"J1": 24, "J2": 2})
+
+
+def test_long_job_25_segments_not_rejected():
+    """核心回归：单作业 25 段必须进入 CP-SAT 规划，而不是被 422 拒绝。"""
+    payload = _long_job_payload(25)
+    r = post(payload)
+    assert r.status_code == 200, r.text
+    d = r.json()
+    assert d["status"] in ("OPTIMAL", "FEASIBLE")
+    assert_plan_complete_and_ordered(d, 27, {"J1": 25, "J2": 2})
+    assert len(d["plan"]) == 27
+    assert d["purge_used_mm3"] <= 10**9
+
+
+def test_long_job_well_beyond_old_cap():
+    """远超旧 24 段上限的长作业同样可规划并返回完整明细。"""
+    payload = _long_job_payload(40)
+    r = post(payload)
+    assert r.status_code == 200, r.text
+    d = r.json()
+    assert d["status"] in ("OPTIMAL", "FEASIBLE")
+    assert_plan_complete_and_ordered(d, 42, {"J1": 40, "J2": 2})
+
+
+def test_large_model_tight_time_limit_returns_full_plan():
+    """大模型 + 极短 time_limit：到期也必须返回完整、作业内有序的计划，
+    且只在确实证明时标 OPTIMAL，否则 FEASIBLE/UNKNOWN 如实返回。"""
+    mats = ["A", "B", "C", "D"]
+    jobs = []
+    per_job = 26
+    for j in range(8):
+        jobs.append({
+            "job_id": f"J{j+1}",
+            "deadline_seconds": 10**9,
+            "segments": [
+                {"material_id": mats[(i + j) % 4],
+                 "print_seconds": (i % 5) + 1, "volume_mm3": 5}
+                for i in range(per_job)
+            ],
+        })
+    payload = {
+        "jobs": jobs,
+        "initial_material": "A",
+        "purge_matrix": {
+            m: {m2: (0 if m == m2 else 30 + 10 * ((i + k) % 5))
+                for k, m2 in enumerate(mats)}
+            for i, m in enumerate(mats)
+        },
+        "switch_seconds": 2,
+        "total_purge_capacity_mm3": 10**9,
+        "time_limit_seconds": 0.5,
+    }
+    r = post(payload)
+    assert r.status_code == 200, r.text
+    d = r.json()
+    nseg = per_job * 8
+    assert len(d["plan"]) == nseg
+    assert d["status"] in ("OPTIMAL", "FEASIBLE", "UNKNOWN")
+    assert_plan_complete_and_ordered(
+        d, nseg, {f"J{j+1}": per_job for j in range(8)}
+    )
+    # 0.5 秒对 208 段模型不足以完成三级证明：不得谎称 OPTIMAL
+    assert d["status"] != "OPTIMAL"
+    assert d["optimal"] is False
+    # FEASIBLE 时给出的 purge 不得超过容量（计划本身容量内可行）
+    if d["status"] == "FEASIBLE":
+        assert d["purge_used_mm3"] <= 10**9
+
+
 # ----------------------------- 422 校验 -----------------------------
 
 def test_422_cases():
@@ -214,10 +359,6 @@ def test_422_cases():
         "negative print": dict(base, jobs=[
             dict(base["jobs"][0], segments=[
                 {"material_id": "PLA", "print_seconds": -1, "volume_mm3": 1}]),
-            base["jobs"][1]]),
-        "too many segments": dict(base, jobs=[
-            dict(base["jobs"][0], segments=[
-                {"material_id": "PLA", "print_seconds": 1, "volume_mm3": 1}] * 25),
             base["jobs"][1]]),
         "missing body": None,
     }

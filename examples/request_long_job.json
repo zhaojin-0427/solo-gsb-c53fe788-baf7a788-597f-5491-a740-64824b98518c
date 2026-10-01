@@ -1,0 +1,170 @@
+{
+  "jobs": [
+    {
+      "job_id": "J1",
+      "deadline_seconds": 100000,
+      "segments": [
+        {
+          "material_id": "PLA",
+          "print_seconds": 10,
+          "volume_mm3": 12
+        },
+        {
+          "material_id": "ABS",
+          "print_seconds": 10,
+          "volume_mm3": 12
+        },
+        {
+          "material_id": "PLA",
+          "print_seconds": 10,
+          "volume_mm3": 12
+        },
+        {
+          "material_id": "ABS",
+          "print_seconds": 10,
+          "volume_mm3": 12
+        },
+        {
+          "material_id": "PLA",
+          "print_seconds": 10,
+          "volume_mm3": 12
+        },
+        {
+          "material_id": "ABS",
+          "print_seconds": 10,
+          "volume_mm3": 12
+        },
+        {
+          "material_id": "PLA",
+          "print_seconds": 10,
+          "volume_mm3": 12
+        },
+        {
+          "material_id": "ABS",
+          "print_seconds": 10,
+          "volume_mm3": 12
+        },
+        {
+          "material_id": "PLA",
+          "print_seconds": 10,
+          "volume_mm3": 12
+        },
+        {
+          "material_id": "ABS",
+          "print_seconds": 10,
+          "volume_mm3": 12
+        },
+        {
+          "material_id": "PLA",
+          "print_seconds": 10,
+          "volume_mm3": 12
+        },
+        {
+          "material_id": "ABS",
+          "print_seconds": 10,
+          "volume_mm3": 12
+        },
+        {
+          "material_id": "PLA",
+          "print_seconds": 10,
+          "volume_mm3": 12
+        },
+        {
+          "material_id": "ABS",
+          "print_seconds": 10,
+          "volume_mm3": 12
+        },
+        {
+          "material_id": "PLA",
+          "print_seconds": 10,
+          "volume_mm3": 12
+        },
+        {
+          "material_id": "ABS",
+          "print_seconds": 10,
+          "volume_mm3": 12
+        },
+        {
+          "material_id": "PLA",
+          "print_seconds": 10,
+          "volume_mm3": 12
+        },
+        {
+          "material_id": "ABS",
+          "print_seconds": 10,
+          "volume_mm3": 12
+        },
+        {
+          "material_id": "PLA",
+          "print_seconds": 10,
+          "volume_mm3": 12
+        },
+        {
+          "material_id": "ABS",
+          "print_seconds": 10,
+          "volume_mm3": 12
+        },
+        {
+          "material_id": "PLA",
+          "print_seconds": 10,
+          "volume_mm3": 12
+        },
+        {
+          "material_id": "ABS",
+          "print_seconds": 10,
+          "volume_mm3": 12
+        },
+        {
+          "material_id": "PLA",
+          "print_seconds": 10,
+          "volume_mm3": 12
+        },
+        {
+          "material_id": "ABS",
+          "print_seconds": 10,
+          "volume_mm3": 12
+        },
+        {
+          "material_id": "PLA",
+          "print_seconds": 10,
+          "volume_mm3": 12
+        }
+      ]
+    },
+    {
+      "job_id": "J2",
+      "deadline_seconds": 100000,
+      "segments": [
+        {
+          "material_id": "PLA",
+          "print_seconds": 10,
+          "volume_mm3": 12
+        },
+        {
+          "material_id": "ABS",
+          "print_seconds": 10,
+          "volume_mm3": 12
+        },
+        {
+          "material_id": "PLA",
+          "print_seconds": 10,
+          "volume_mm3": 12
+        }
+      ]
+    }
+  ],
+  "initial_material": "PLA",
+  "purge_matrix": {
+    "PLA": {
+      "PLA": 0,
+      "ABS": 60
+    },
+    "ABS": {
+      "PLA": 40,
+      "ABS": 0
+    }
+  },
+  "switch_seconds": 5,
+  "total_purge_capacity_mm3": 10000,
+  "time_limit_seconds": 15
+}
