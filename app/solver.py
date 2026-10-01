@@ -17,6 +17,15 @@
 3. 计划按 ``(作业 ID, 层序)`` 的字典序最小——采用逐位贪心固定前缀 +
    可行性检查的方式，每一步都经过 CP-SAT 可行性证明，因此完成全部位置
    后即"证明字典序最小"；任何一步在限时内无法判定则保守地不声称最优。
+
+长作业与超时兜底
+----------------
+
+层段数量没有固定上限，合法的长作业（如单作业 25 段以上）直接进入
+CP-SAT 规划。若大模型在 ``time_limit_seconds`` 内连一个可行解都找不到，
+求解器会用免求解的构造性排列（严格遵守作业内层序、purge 经精确核算不
+超容）兜底，仍返回完整的计划 / 切换记录 / purge / 逾期明细，状态如实
+标记为 ``FEASIBLE``；构造性候选也超容时才返回 ``UNKNOWN``。
 """
 
 from __future__ import annotations
@@ -409,6 +418,9 @@ def _lexicographic_fix(
     deadline_wall = time.monotonic() + total_cap
 
     for _ in range(n):
+        if deadline_wall - time.monotonic() <= 0.02:
+            # 总预算已耗尽：不再构建新模型，保守地不声称字典序最优
+            return best_order, False
         candidates = [
             v
             for v in range(1, n + 1)
@@ -419,10 +431,12 @@ def _lexicographic_fix(
 
         chosen: Optional[int] = None
         for v in candidates:
+            remaining = deadline_wall - time.monotonic()
+            if remaining <= 0.02:
+                return best_order, False
             trial = dict(forced)
             trial[(prev, v)] = True
-            remaining = max(0.05, deadline_wall - time.monotonic())
-            limit = min(per_check_limit, remaining) if remaining > 0 else 0.05
+            limit = min(per_check_limit, remaining)
             status, feas_order = _feasibility_check(
                 inst, trial, purge_star, tard_star, limit, hint
             )
@@ -477,19 +491,84 @@ def diagnose_infeasible(inst: Instance, time_limit: float) -> Tuple[str, dict]:
     )
 
 
+def _heuristic_orders(inst: Instance) -> List[List[int]]:
+    """构造性候选排列（均严格遵守作业内层段顺序，因此必定合法）。
+
+    CP-SAT 在限时内可能连一个可行解都找不到（大模型 / 时限极短）。
+    用这些免求解的排列作为兜底，保证 API 仍能返回完整计划：
+
+    * 输入作业顺序（作业内按层序，作业间不交错）；
+    * 反向输入作业顺序；
+    * 按截止时刻升序（EDD，倾向降低逾期）；
+    * 按作业 ID 升序（字典序倾向）。
+    """
+    job_orders = [
+        [jd for jd in inst.jobs],
+        list(reversed(inst.jobs)),
+        sorted(inst.jobs, key=lambda jd: (jd.deadline, jd.job_id)),
+        sorted(inst.jobs, key=lambda jd: jd.job_id),
+    ]
+    orders: List[List[int]] = []
+    seen: set = set()
+    for jds in job_orders:
+        order = [seg["global_idx"] for jd in jds for seg in jd.segments]
+        key = tuple(order)
+        if key not in seen:
+            seen.add(key)
+            orders.append(order)
+    return orders
+
+
+def _feasible_heuristic(
+    inst: Instance,
+) -> Optional[Tuple[List[int], dict]]:
+    """在所有构造性候选中挑出满足 purge 容量且 (purge, 逾期, 字典序) 最优者。
+
+    紧密排产下任一遵守层序的排列都是可执行计划；purge 是否超容可经
+    :func:`_materialize` 精确核算，不需要求解器参与。找不到满足容量的
+    候选时返回 ``None``（可能真的容量无解，也可能只是启发式未找到）。
+    """
+    best: Optional[Tuple[Tuple[int, int, Tuple], List[int], dict]] = None
+    for order in _heuristic_orders(inst):
+        tl = _materialize(inst, order)
+        if tl["purge_used_mm3"] > inst.purge_capacity:
+            continue
+        rank_key = tuple(
+            inst.rank_of[i] for i in order
+        )
+        score = (
+            tl["purge_used_mm3"],
+            tl["total_tardiness_seconds"],
+            rank_key,
+        )
+        if best is None or score < best[0]:
+            best = (score, order, tl)
+    if best is None:
+        return None
+    return best[1], best[2]
+
+
 def solve(req: PlanRequest) -> dict:
-    """求解入口，返回可直接用于构造 PlanResponse 的结果字典。"""
+    """求解入口，返回可直接用于构造 PlanResponse 的结果字典。
+
+    任何情况下只要能给出可执行计划，就返回完整的计划 / 切换 / purge /
+    逾期明细；只有确实拿不到计划时才返回 ``UNKNOWN``。三级目标的最优性
+    分别按 CP-SAT 实际返回的状态如实标记，字典序决胜未完成证明时
+    不声称 ``OPTIMAL``。
+    """
     inst = build_instance(req)
     time_limit = float(req.time_limit_seconds or 15.0)
     t_phase = max(1.0, min(10.0, 0.4 * time_limit))
     per_check = max(0.2, min(1.5, 0.1 * time_limit))
     greedy_cap = max(2.0, 0.35 * time_limit)
 
-    proven_optimal = True
+    # 构造性可行计划：作为 CP-SAT 提示加速首解，并在超时时兜底
+    heur = _feasible_heuristic(inst)
+    heur_order = heur[0] if heur is not None else None
 
     # ---- 阶段 1：最小化 purge ----
     art1 = build_model(inst)
-    r1 = _solve(art1, art1.purge_var, t_phase, inst=inst)
+    r1 = _solve(art1, art1.purge_var, t_phase, inst=inst, hint_order=heur_order)
 
     if r1.status == "INFEASIBLE":
         code, detail = diagnose_infeasible(inst, t_phase)
@@ -499,62 +578,111 @@ def solve(req: PlanRequest) -> dict:
             "infeasible_reason": detail,
             "solver_message": f"模型无解，归因: {code}",
         }
-    if r1.order is None or r1.purge is None:
+
+    purge_proven = r1.status == "OPTIMAL"
+    if r1.order is not None and r1.purge is not None:
+        best_order = r1.order
+        purge_star = r1.purge
+        tard_star = None
+    elif heur is not None:
+        # 求解器超时且未给出可行解：用构造性计划兜底，目标均未证明
+        best_order, heur_tl = heur
+        purge_star = heur_tl["purge_used_mm3"]
+        tard_star = heur_tl["total_tardiness_seconds"]
+        return _build_response(
+            inst,
+            best_order,
+            purge_proven=False,
+            tard_proven=False,
+            lex_proven=False,
+            status="FEASIBLE",
+            solver_message=(
+                f"限时内 CP-SAT 未找到可行解（{r1.message}）；"
+                "返回构造性可行计划（作业内层段严格按序），未证明任何目标最优"
+            ),
+        )
+    else:
         return {
             "status": "UNKNOWN",
             "optimal": False,
             "infeasible_reason": None,
-            "solver_message": f"限时内未找到可行解 ({r1.message})",
+            "solver_message": (
+                f"限时内未找到可行解（{r1.message}），"
+                "且构造性候选均不满足 purge 容量"
+            ),
         }
-    if r1.status != "OPTIMAL":
-        proven_optimal = False
-    purge_star = r1.purge
 
     # ---- 阶段 2：purge 固定，最小化逾期 ----
     art2 = build_model(inst, purge_eq=purge_star)
-    r2 = _solve(art2, art2.tardiness_var, t_phase, inst=inst, hint_order=r1.order)
-    if r2.status == "INFEASIBLE" or r2.order is None or r2.tardiness is None:
-        # 不应发生：阶段 1 的解本身可行；退回阶段 1 解，保守标记
-        best_order = r1.order
-        # 用阶段 1 解重算逾期值（对紧密排产，等于完成时刻与截止的差）
-        from_model = _materialize(inst, r1.order)
-        tard_star = from_model["total_tardiness_seconds"]
-        proven_optimal = False
-    else:
-        if r2.status != "OPTIMAL":
-            proven_optimal = False
-        best_order = r2.order
-        tard_star = r2.tardiness
+    r2 = _solve(art2, art2.tardiness_var, t_phase, inst=inst, hint_order=best_order)
+    tard_proven = False
+    if r2.order is not None and r2.tardiness is not None:
+        if r2.status != "INFEASIBLE":
+            best_order = r2.order
+            tard_star = r2.tardiness
+            tard_proven = purge_proven and r2.status == "OPTIMAL"
+    if tard_star is None:
+        # 不应发生：阶段 1 的解本身可行；用阶段 1 解重算逾期，保守标记
+        tl1 = _materialize(inst, best_order)
+        tard_star = tl1["total_tardiness_seconds"]
+        tard_proven = False
 
-    # ---- 阶段 3：字典序最小决胜 ----
+    # ---- 阶段 3：字典序最小决胜（仅前两级均已证最优时才值得做）----
     lex_proven = False
-    if proven_optimal:
+    if purge_proven and tard_proven:
         best_order, lex_proven = _lexicographic_fix(
             inst, best_order, purge_star, tard_star, per_check, greedy_cap
         )
 
-    timeline = _materialize(inst, best_order)
-    timeline["status"] = "OPTIMAL" if (proven_optimal and lex_proven) else "FEASIBLE"
-    timeline["optimal"] = proven_optimal and lex_proven
-    timeline["objective"] = {
-        "total_purge_mm3": timeline["purge_used_mm3"],
-        "total_tardiness_seconds": timeline["total_tardiness_seconds"],
-        "purge_optimal": proven_optimal,
-        "tardiness_optimal": proven_optimal,
-        "lexicographic_minimal": lex_proven,
-    }
-    timeline["infeasible_reason"] = None
-    if not lex_proven and proven_optimal:
-        timeline["solver_message"] = (
+    proven = purge_proven and tard_proven and lex_proven
+    if proven:
+        status = "OPTIMAL"
+        message = "已证明三级目标（purge、逾期、字典序）均最优"
+    elif purge_proven and tard_proven:
+        status = "FEASIBLE"
+        message = (
             "purge 与逾期均已证最优；字典序决胜在限时内未完全证明，"
             "返回当前最优目标值下的可行计划（不声称字典序最小）"
         )
-    elif not proven_optimal:
-        timeline["solver_message"] = (
-            "限时内得到可行解并给出了目标值，但未证明最优"
-        )
+    elif purge_proven:
+        status = "FEASIBLE"
+        message = "purge 已证最优；逾期优化在限时内未证明，字典序决胜未执行"
     else:
-        timeline["solver_message"] = "已证明三级目标（purge、逾期、字典序）均最优"
+        status = "FEASIBLE"
+        message = "限时内得到可行解并给出了目标值，但未证明最优"
+    return _build_response(
+        inst,
+        best_order,
+        purge_proven=purge_proven,
+        tard_proven=tard_proven,
+        lex_proven=lex_proven,
+        status=status,
+        solver_message=message,
+    )
+
+
+def _build_response(
+    inst: Instance,
+    order: List[int],
+    *,
+    purge_proven: bool,
+    tard_proven: bool,
+    lex_proven: bool,
+    status: str,
+    solver_message: str,
+) -> dict:
+    timeline = _materialize(inst, order)
+    timeline["status"] = status
+    timeline["optimal"] = purge_proven and tard_proven and lex_proven
+    timeline["objective"] = {
+        "total_purge_mm3": timeline["purge_used_mm3"],
+        "total_tardiness_seconds": timeline["total_tardiness_seconds"],
+        "purge_optimal": purge_proven,
+        "tardiness_optimal": tard_proven,
+        "lexicographic_minimal": lex_proven,
+    }
+    timeline["infeasible_reason"] = None
+    timeline["solver_message"] = solver_message
     return timeline
 
 

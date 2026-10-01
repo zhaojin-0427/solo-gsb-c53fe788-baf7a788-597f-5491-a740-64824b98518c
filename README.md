@@ -75,7 +75,7 @@ pytest -q
 | `jobs` | 数组（2～8 项） | 作业列表 |
 | `jobs[].job_id` | 非空字符串 | 作业 ID，全局唯一 |
 | `jobs[].deadline_seconds` | 非负整数 | 截止秒数（相对开工时刻 0） |
-| `jobs[].segments` | 非空数组（1～24 段） | 按打印顺序排列的层段 |
+| `jobs[].segments` | 非空数组（至少 1 段，无固定上限） | 按打印顺序排列的层段；单作业 25 段及以上的长作业同样进入 CP-SAT 规划 |
 | `segments[].material_id` | 非空字符串 | 层段材料 ID |
 | `segments[].print_seconds` | 非负整数 | 层段打印秒数 |
 | `segments[].volume_mm3` | 非负整数 | 层段耗材体积 mm³（记录用） |
@@ -214,14 +214,55 @@ curl -X POST http://localhost:8000/plans \
   仅作为防御性归因）；
 - `UNKNOWN`：限时内无法完成归因诊断。
 
+### 长作业（单作业 25 段及以上）
+
+层段数量没有固定上限：单个作业包含 25 个或更多按序层段时是**合法请求**，
+不会被拒绝（HTTP 422 仅针对真正非法的输入），而是直接进入 OR-Tools
+CP-SAT 规划。示例 `examples/request_long_job.json` 中 `LONG` 作业含 25 个
+按序层段（PLA/ABS/TPU 循环）：
+
+```bash
+docker compose up --build -d
+
+curl -X POST http://localhost:8000/plans \
+  -H 'Content-Type: application/json' \
+  -d @examples/request_long_job.json
+```
+
+响应与普通请求结构完全一致：`plan` 覆盖全部层段且每个作业内的
+`segment_index` 严格按 1…N 排列，`switches` / `job_tardiness` /
+`purge_used_mm3` / `purge_remaining_mm3` 等明细同样完整返回；三级目标
+全部由 CP-SAT 证明时才标记 `"status": "OPTIMAL"`。
+
+当模型较大或 `time_limit_seconds` 到期时：
+
+- CP-SAT 已给出可行解但未完成最优性证明 → `FEASIBLE`，`objective` 中
+  `purge_optimal` / `tardiness_optimal` / `lexicographic_minimal` 分别
+  如实反映各级目标**是否确已证明**（可能 purge 已证最优而字典序未证明）；
+- CP-SAT 连可行解都未找到 → 服务用免求解的**构造性排列**兜底（严格遵守
+  作业内层段顺序，purge 经精确核算不超容），仍返回完整、按序的计划与全部
+  明细，状态为 `FEASIBLE`，且三个最优性标记均为 `false`；
+- 构造性候选也不满足 purge 容量（或确属容量无解）→ `UNKNOWN` /
+  `INFEASIBLE`，此时 `plan` 为空，不会伪造计划。
+
+可用极短时限观察该行为（大模型通常来不及证明最优）：
+
+```bash
+curl -X POST http://localhost:8000/plans \
+  -H 'Content-Type: application/json' \
+  -d @examples/request_long_job.json \
+  | python3 -c 'import json,sys; d=json.load(sys.stdin); print(d["status"], d["objective"])'
+# OPTIMAL {'total_purge_mm3': 2320, ..., 'lexicographic_minimal': True}
+```
+
 ### 求解状态语义
 
 | `status` | `optimal` | 含义 |
 | --- | --- | --- |
 | `OPTIMAL` | `true` | 三级目标（含字典序决胜）均已由 CP-SAT 证明最优 |
-| `FEASIBLE` | `false` | 限时内得到可行计划，`objective` 给出当前目标值，但**未证明最优**（字典序决胜未完成证明时也用此状态） |
+| `FEASIBLE` | `false` | 已得到可行计划并给出完整明细，但**未证明全部目标最优**；`objective` 中三个 `*_optimal` 标记分别如实表示 purge / 逾期 / 字典序是否确已证明（含 CP-SAT 超时后由构造性排列兜底的情形，此时三者均为 `false`） |
 | `INFEASIBLE` | `false` | 无解，见 `infeasible_reason` |
-| `UNKNOWN` | `false` | 限时内连可行解都未找到 |
+| `UNKNOWN` | `false` | 限时内连可行计划都无法给出（构造性候选也不满足容量） |
 
 ### 非法数据（HTTP 422）
 
@@ -257,9 +298,10 @@ curl -i -X POST http://localhost:8000/plans \
 │   └── solver.py      # CP-SAT 建模、分阶段求解与字典序决胜
 ├── examples/
 │   ├── request.json              # 可行示例
+│   ├── request_long_job.json     # 长作业示例（单作业 25 段）
 │   └── request_infeasible.json   # 容量超限示例
 ├── tests/
-│   └── test_plans.py  # 9 个端到端测试（最优性、无解、交错、优先级、422 等）
+│   └── test_plans.py  # 13 个端到端测试（最优性、无解、交错、优先级、长作业、超时兜底、422 等）
 ├── Dockerfile
 ├── docker-compose.yml
 ├── requirements.txt
@@ -281,3 +323,9 @@ curl -i -X POST http://localhost:8000/plans \
   `FEASIBLE`，绝不声称未证明的最优性。
 - 无解时临时移除容量上限再求最小 purge：仍无解归因为 `PRECEDENCE`，
   最小 purge 超出容量则归因为 `CAPACITY` 并给出最小需求值。
+- 层段数没有固定上限，长作业直接建模；大模型在 `time_limit_seconds` 内
+  未求得可行解时，用免求解的构造性排列（作业顺序、截止时间升序等候选）
+  兜底并精确核算 purge，仍返回完整、按序的计划与全部明细，状态如实标为
+  `FEASIBLE`，仅当兜底排列也超容时才返回 `UNKNOWN`。三级目标的最优性
+  标记互相独立，只有 CP-SAT 对相应目标（以及字典序决胜的每一步可行性）
+  确已证明时才置为 `true`。

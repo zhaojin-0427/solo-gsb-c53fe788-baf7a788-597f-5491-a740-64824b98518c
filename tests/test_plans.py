@@ -190,6 +190,108 @@ def test_lexicographic_tiebreak_prefects_smaller_job_id():
     assert d["objective"]["lexicographic_minimal"] is True
 
 
+# ----------------------------- 长作业（≥25 段） -----------------------------
+
+def _assert_plan_consistent(d: dict, expected_counts: dict) -> None:
+    """计划完整、作业内层段按序、切换记录与时间线一致。"""
+    assert len(d["plan"]) == sum(expected_counts.values())
+    # order 连续覆盖 1..N
+    assert [p["order"] for p in d["plan"]] == list(range(1, len(d["plan"]) + 1))
+    # 每个作业内层段 1..k 按序出现
+    for job_id, count in expected_counts.items():
+        idxs = [p["segment_index"] for p in d["plan"] if p["job_id"] == job_id]
+        assert idxs == list(range(1, count + 1))
+    # 切换记录与时间线一致
+    sw = d["switches"]
+    assert sum(s["purge_mm3"] for s in sw) == d["purge_used_mm3"]
+    for s in sw:
+        before = d["plan"][s["after_segment_order"] - 1] if s["after_segment_order"] else None
+        after = d["plan"][s["after_segment_order"]]
+        base_end = before["end_seconds"] if before else 0
+        assert after["start_seconds"] == base_end + s["switch_seconds"]
+        assert s["at_seconds"] == base_end
+        if before is None:
+            # 首次切换来自请求中的初始材料
+            assert s["from_material"] is not None
+    # 无切换处首尾相接
+    switch_after = {s["after_segment_order"] for s in sw}
+    for i, p in enumerate(d["plan"][:-1], start=1):
+        if i not in switch_after:
+            assert d["plan"][i]["start_seconds"] == p["end_seconds"]
+    # 逾期明细完整
+    assert {j["job_id"] for j in d["job_tardiness"]} == set(expected_counts)
+    assert sum(j["tardy_seconds"] for j in d["job_tardiness"]) == d["total_tardiness_seconds"]
+
+
+def test_long_job_example_25_segments_accepted():
+    """25 段（及更多）的合法作业不再被 24 段上限拒绝，进入 CP-SAT 规划。"""
+    payload = load_example("request_long_job.json")
+    r = post(payload)
+    assert r.status_code == 200, r.text
+    d = r.json()
+    assert d["status"] == "OPTIMAL"
+    assert d["optimal"] is True
+    assert d["objective"]["lexicographic_minimal"] is True
+    _assert_plan_consistent(d, {"LONG": 25, "AUX": 2})
+
+
+def test_twenty_four_segments_still_ok():
+    """边界：旧上限 24 段行为不变。"""
+    payload = load_example("request_long_job.json")
+    payload["jobs"][0]["segments"] = payload["jobs"][0]["segments"][:24]
+    d = post(payload).json()
+    _assert_plan_consistent(d, {"LONG": 24, "AUX": 2})
+    assert d["status"] in ("OPTIMAL", "FEASIBLE")
+
+
+def test_large_model_timeout_still_returns_full_plan():
+    """大模型 + 极短 time_limit：超时也必须返回完整、按序的可行计划，
+    且只在目标确已证明时才标 OPTIMAL。"""
+    mats = ["PLA", "ABS", "TPU", "PETG"]
+    purge_matrix = {a: {b: (0 if a == b else 100) for b in mats} for a in mats}
+    jobs = []
+    for j in range(8):
+        jobs.append({
+            "job_id": f"J{j:02d}",
+            "deadline_seconds": 10 ** 9,
+            "segments": [
+                {"material_id": mats[(j + k) % 4], "print_seconds": 10, "volume_mm3": 5}
+                for k in range(30)
+            ],
+        })
+    payload = {
+        "jobs": jobs,
+        "initial_material": "PLA",
+        "purge_matrix": purge_matrix,
+        "switch_seconds": 2,
+        "total_purge_capacity_mm3": 10 ** 7,
+        "time_limit_seconds": 0.5,
+    }
+    d = post(payload).json()
+    assert d["status"] in ("FEASIBLE", "OPTIMAL")
+    assert d["plan"], "超时也必须返回完整计划"
+    _assert_plan_consistent(d, {f"J{j:02d}": 30 for j in range(8)})
+    # 目标未证明时绝不声称最优
+    obj = d["objective"]
+    assert d["optimal"] == (
+        obj["purge_optimal"] and obj["tardiness_optimal"] and obj["lexicographic_minimal"]
+    )
+    if d["status"] == "FEASIBLE":
+        assert d["optimal"] is False
+
+
+def test_long_job_capacity_infeasible_unchanged():
+    """长作业下容量无解行为不变（构造性候选也超容时如实 UNKNOWN/INFEASIBLE，
+    绝不伪造计划）。"""
+    payload = load_example("request_long_job.json")
+    payload["total_purge_capacity_mm3"] = 1
+    payload["time_limit_seconds"] = 5
+    d = post(payload).json()
+    assert d["status"] in ("INFEASIBLE", "UNKNOWN")
+    assert d["optimal"] is False
+    assert d["plan"] == []
+
+
 # ----------------------------- 422 校验 -----------------------------
 
 def test_422_cases():
@@ -214,10 +316,6 @@ def test_422_cases():
         "negative print": dict(base, jobs=[
             dict(base["jobs"][0], segments=[
                 {"material_id": "PLA", "print_seconds": -1, "volume_mm3": 1}]),
-            base["jobs"][1]]),
-        "too many segments": dict(base, jobs=[
-            dict(base["jobs"][0], segments=[
-                {"material_id": "PLA", "print_seconds": 1, "volume_mm3": 1}] * 25),
             base["jobs"][1]]),
         "missing body": None,
     }
